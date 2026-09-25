@@ -12,7 +12,8 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import MessageEntityType
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton,
+                           InlineKeyboardMarkup, Message)
 from dotenv import load_dotenv
 
 from spam_filter import Features, Verdict, score_message, word_set
@@ -41,6 +42,7 @@ class DB:
         self.c.executescript("""
             CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, clean INTEGER DEFAULT 0, trusted INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS words(word TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value INTEGER);
             CREATE TABLE IF NOT EXISTS examples(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT UNIQUE);
             CREATE TABLE IF NOT EXISTS events(ts INTEGER, chat_id INTEGER, actor_id INTEGER, action TEXT,
                                               score INTEGER, reasons TEXT, text TEXT);
@@ -92,12 +94,34 @@ class DB:
                         "; ".join(verdict.reasons) if verdict else "", text[:500]))
         self.c.commit()
 
+    def get_setting(self, key, default: int) -> int:
+        row = self.c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return int(row[0]) if row else default
+
+    def set_setting(self, key, value: int):
+        self.c.execute("INSERT INTO settings VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=?", (key, value, value))
+        self.c.commit()
+
     def stats(self, since):
         return dict(self.c.execute("SELECT action, COUNT(*) FROM events WHERE ts>=? GROUP BY action", (since,)))
 
 
 db = DB(DB_PATH)
-state = {"chat_id": DISCUSSION_CHAT_ID, "dry_run": DRY_RUN}
+state = {"chat_id": DISCUSSION_CHAT_ID}
+# Значения по умолчанию; всё, что меняется через /settings, хранится в базе и переживает перезапуск
+DEFAULTS = {"autoban": int(not DRY_RUN), "autodelete": int(not DRY_RUN), "notify": 1,
+            "ban_score": BAN_SCORE, "suspect_score": SUSPECT_SCORE}
+
+
+def cfg(key: str) -> int:
+    return db.get_setting(key, DEFAULTS[key])
+
+
+def mode_text() -> str:
+    if cfg("autoban"):
+        return "автобан ВКЛ"
+    return "автобан ВЫКЛ, автоудаление " + ("ВКЛ" if cfg("autodelete") else "ВЫКЛ") + " (решаешь кнопками)"
+
 admin_cache: dict = {}
 cas_cache: dict = {}
 
@@ -164,6 +188,18 @@ def report(title, name, actor_id, verdict: Verdict, text, link=None) -> str:
     if link:
         parts.append(f'<a href="{link}">Открыть сообщение</a>')
     return "\n".join(parts)
+
+
+def btn(text, data):
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def decision_kb(chat_id, actor_id, msg_id, deleted: bool) -> InlineKeyboardMarkup:
+    row = [btn("🔨 Забанить", f"b:{chat_id}:{actor_id}:{msg_id}")]
+    if not deleted:
+        row.append(btn("🗑 Удалить", f"d:{chat_id}:{msg_id}"))
+    row.append(btn("✅ Не спам", f"ok:{actor_id}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row])
 
 
 def features_from(message: Message, actor_name: str, first: bool, foreign_chat: bool) -> Features:
@@ -236,33 +272,82 @@ async def on_group_message(message: Message, bot: Bot):
         verdict.add(10, "в базе спамеров CAS")
 
     link = msg_link(chat_id, message.message_id)
-    if verdict.score >= BAN_SCORE:
-        if state["dry_run"]:
-            db.event(chat_id, actor_id, "dry_ban", verdict, f.text)
-            kb = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="🔨 Забанить", callback_data=f"b:{chat_id}:{actor_id}:{message.message_id}"),
-                InlineKeyboardButton(text="✅ Не спам", callback_data=f"ok:{actor_id}")]])
-            await notify(bot, report("[тестовый режим] Был бы бан", actor_name, actor_id, verdict, f.text, link), kb)
-            return
-        try:
-            await message.delete()
-            await ban_actor(bot, chat_id, actor_id)
-        except TelegramBadRequest as e:
-            log.error("не смог забанить %s: %s (у бота есть права админа?)", actor_id, e)
-            return
-        db.event(chat_id, actor_id, "ban", verdict, f.text)
-        log.info("бан %s, баллы %s", actor_id, verdict.score)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="↩️ Разбанить", callback_data=f"u:{chat_id}:{actor_id}")]])
-        await notify(bot, report("🔨 Забанен", actor_name, actor_id, verdict, f.text), kb)
-    elif verdict.score >= SUSPECT_SCORE:
+    msg_id = message.message_id
+    if verdict.score >= cfg("ban_score"):
+        deleted = banned = False
+        errors = []
+        if cfg("autodelete") or cfg("autoban"):
+            try:
+                await message.delete()
+                deleted = True
+            except TelegramBadRequest as e:
+                errors.append(f"удалить: {e.message}")
+        if cfg("autoban"):
+            try:
+                await ban_actor(bot, chat_id, actor_id)
+                banned = True
+            except TelegramBadRequest as e:
+                errors.append(f"забанить: {e.message}")
+        action = "ban" if banned else "delete" if deleted else "spam_detected"
+        db.event(chat_id, actor_id, action, verdict, f.text)
+        log.info("спам от %s, баллы %s, действие %s %s", actor_id, verdict.score, action, errors or "")
+        if banned:
+            title = "🔨 Спам: удалён, автор забанен"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[btn("↩️ Разбанить", f"u:{chat_id}:{actor_id}")]])
+        else:
+            title = "🗑 Спам удалён, автор НЕ забанен" if deleted else "🚨 Спам! Автобан выключен"
+            kb = decision_kb(chat_id, actor_id, msg_id, deleted)
+        if errors:
+            title += "\n⚠️ Не смог " + "; ".join(errors) + " (проверь права бота)"
+        if cfg("notify") or not banned:  # без автобана решение за тобой, поэтому пуш всегда
+            await notify(bot, report(title, actor_name, actor_id, verdict, f.text, None if deleted else link), kb)
+    elif verdict.score >= cfg("suspect_score"):
         db.event(chat_id, actor_id, "suspect", verdict, f.text)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🔨 Забанить", callback_data=f"b:{chat_id}:{actor_id}:{message.message_id}"),
-            InlineKeyboardButton(text="✅ Не спам", callback_data=f"ok:{actor_id}")]])
-        await notify(bot, report("⚠️ Подозрительный комментарий", actor_name, actor_id, verdict, f.text, link), kb)
+        await notify(bot, report("⚠️ Подозрительный комментарий", actor_name, actor_id, verdict, f.text, link),
+                     decision_kb(chat_id, actor_id, msg_id, deleted=False))
     elif not message.edit_date:
         db.add_clean(actor_id)
+
+
+# ---------- настройки ----------
+TOGGLES = [("autoban", "Автобан"), ("autodelete", "Автоудаление"), ("notify", "Пуш об автобане")]
+
+
+def settings_view():
+    text = ("<b>Настройки антиспама</b>\n\n"
+            "<b>Автобан</b> — сразу банить автора спама (заодно удаляются все его сообщения в группе).\n"
+            "<b>Автоудаление</b> — сразу удалять спам-сообщение, даже если автобан выключен.\n"
+            "<b>Пуш об автобане</b> — присылать отчёт, когда бот забанил сам. "
+            "Если автобан выключен, пуш с кнопкой «Забанить» приходит всегда.\n\n"
+            f"Спам — от <b>{cfg('ban_score')}</b> баллов, подозрительное — от <b>{cfg('suspect_score')}</b>.")
+    rows = [[btn(("✅ " if cfg(k) else "❌ ") + name, f"s:{k}")] for k, name in TOGGLES]
+    for key, name in (("ban_score", "Порог спама"), ("suspect_score", "Порог подозрения")):
+        rows.append([btn("−", f"s:{key}:-1"), btn(f"{name}: {cfg(key)}", "s:noop"), btn("+", f"s:{key}:1")])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.from_user.id == OWNER_ID, F.data.startswith("s:"))
+async def on_settings_button(cb: CallbackQuery):
+    _, key, *delta = cb.data.split(":")
+    if key in ("autoban", "autodelete", "notify") and not delta:
+        db.set_setting(key, 1 - cfg(key))
+    elif key in ("ban_score", "suspect_score") and delta:
+        value = min(20, max(1, cfg(key) + int(delta[0])))
+        ban = value if key == "ban_score" else cfg("ban_score")
+        sus = value if key == "suspect_score" else cfg("suspect_score")
+        if sus > ban:
+            await cb.answer("Порог подозрения не может быть выше порога спама", show_alert=True)
+            return
+        db.set_setting(key, value)
+    else:
+        await cb.answer()
+        return
+    text, kb = settings_view()
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass
+    await cb.answer("Сохранено")
 
 
 # ---------- кнопки в уведомлениях ----------
@@ -279,6 +364,11 @@ async def on_button(cb: CallbackQuery, bot: Bot):
             await ban_actor(bot, chat_id, actor_id)
             db.event(chat_id, actor_id, "manual_ban")
             done = "🔨 Забанен"
+        elif kind == "d":
+            chat_id, msg_id = map(int, args)
+            await bot.delete_message(chat_id, msg_id)
+            db.event(chat_id, 0, "manual_delete")
+            done = "🗑 Удалено"
         elif kind == "u":
             chat_id, actor_id = map(int, args)
             await unban_actor(bot, chat_id, actor_id)
@@ -307,21 +397,29 @@ async def cmd_help(message: Message):
     await message.answer(
         "<b>Антиспам «За гранью»</b>\n"
         f"Чат обсуждения: <code>{state['chat_id'] or 'не найден'}</code>\n"
-        f"Режим: {'ТЕСТОВЫЙ (только сообщаю)' if state['dry_run'] else 'БОЕВОЙ (баню)'}\n"
-        f"Порог бана: {BAN_SCORE}, подозрение: {SUSPECT_SCORE}\n\n"
-        "/stats — статистика\n/mode test|live — режим\n"
+        f"Режим: {mode_text()}\n\n"
+        "/settings — автобан, автоудаление, пуши, пороги\n"
+        "/mode live|test — всё включить / всё выключить\n"
+        "/stats — статистика\n"
         "/words — свои стоп-слова\n/addword слово — добавить\n/delword слово — удалить\n"
         "/unban id — разбанить\n/trust id — в доверенные\n\n"
-        "<b>Образцы спама</b> (похожее банится сразу):\n"
+        "<b>Образцы спама</b> (похожее считается спамом сразу):\n"
         "перешли мне спам-сообщение или просто пришли его текст — сохраню как образец\n"
         "/examples — список, /delexample N — удалить\n\n"
         "В группе: ответь <code>/spam</code> на сообщение, чтобы удалить, забанить и запомнить как образец.")
 
 
+@router.message(Command("settings"), owner, F.from_user.id == OWNER_ID)
+async def cmd_settings(message: Message):
+    text, kb = settings_view()
+    await message.answer(text, reply_markup=kb)
+
+
 @router.message(Command("stats"), owner, F.from_user.id == OWNER_ID)
 async def cmd_stats(message: Message):
-    names = {"ban": "Забанено авто", "manual_ban": "Забанено вручную", "suspect": "Подозрительных",
-             "dry_ban": "Был бы бан (тест)", "unban": "Разбанено"}
+    names = {"ban": "Забанено авто", "manual_ban": "Забанено вручную", "delete": "Удалено авто без бана",
+             "manual_delete": "Удалено вручную", "spam_detected": "Спам без действий",
+             "suspect": "Подозрительных", "dry_ban": "Был бы бан (тест)", "unban": "Разбанено"}
     out = []
     for title, since in (("24 часа", time.time() - 86400), ("7 дней", time.time() - 7 * 86400), ("всё время", 0)):
         s = db.stats(int(since))
@@ -332,9 +430,9 @@ async def cmd_stats(message: Message):
 @router.message(Command("mode"), owner, F.from_user.id == OWNER_ID)
 async def cmd_mode(message: Message, command: CommandObject):
     if command.args in ("test", "live"):
-        state["dry_run"] = command.args == "test"
-    await message.answer("Режим: " + ("тестовый" if state["dry_run"] else "боевой") +
-                         "\n(после перезапуска берётся DRY_RUN из .env)")
+        for key in ("autoban", "autodelete"):
+            db.set_setting(key, int(command.args == "live"))
+    await message.answer(f"Режим: {mode_text()}\nТонко — в /settings")
 
 
 @router.message(Command("words"), owner, F.from_user.id == OWNER_ID)
@@ -435,9 +533,19 @@ async def main():
     if not state["chat_id"]:
         log.warning("DISCUSSION_CHAT_ID не задан и не найден: проверяю ВСЕ группы, где бот админ. "
                     "Напиши /chatid в группе и пропиши id в .env")
-    log.info("чат обсуждения: %s, режим: %s", state["chat_id"], "тест" if state["dry_run"] else "боевой")
-    await notify(bot, f"Антиспам запущен. Чат: <code>{state['chat_id']}</code>, "
-                      f"режим: {'тестовый' if state['dry_run'] else 'боевой'}. /help")
+    log.info("чат обсуждения: %s, режим: %s", state["chat_id"], mode_text())
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="settings", description="Автобан, удаление, пуши, пороги"),
+            BotCommand(command="stats", description="Статистика"),
+            BotCommand(command="mode", description="live — всё вкл, test — всё выкл"),
+            BotCommand(command="examples", description="Образцы спама"),
+            BotCommand(command="words", description="Стоп-слова"),
+            BotCommand(command="help", description="Все команды"),
+        ], scope=BotCommandScopeChat(chat_id=OWNER_ID))
+    except TelegramBadRequest as e:
+        log.warning("не смог выставить меню команд: %s", e)
+    await notify(bot, f"Антиспам запущен. Чат: <code>{state['chat_id']}</code>\nРежим: {mode_text()}\n/settings")
     dp = Dispatcher()
     dp.include_router(router)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
