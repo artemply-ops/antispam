@@ -23,6 +23,12 @@ def add_bytes(tar, name, data: bytes):
 
 def main():
     files = subprocess.check_output(["git", "ls-files"], cwd=ROOT, text=True).split()
+    # Не выкладывать сломанный код: синтаксис + тесты до отправки на сервер
+    py = [f for f in files if f.endswith(".py")]
+    if subprocess.run([sys.executable, "-m", "py_compile", *py], cwd=ROOT).returncode:
+        sys.exit("Синтаксическая ошибка, выкладка отменена")
+    if subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=ROOT).returncode:
+        sys.exit("Тесты не прошли, выкладка отменена")
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
         for f in files:
