@@ -443,6 +443,15 @@ async def on_button(cb: CallbackQuery, bot: Bot):
             db.set_trusted(actor_id)
             db.event(chat_id, actor_id, "unban")
             done = "↩️ Разбанен и добавлен в доверенные"
+        elif kind == "pb":
+            chat_id, actor_id = state["chat_id"], int(args[0])
+            await ban_actor(bot, chat_id, actor_id)
+            db.mark_handled(chat_id, actor_id=actor_id)
+            db.set_trusted(actor_id, False)
+            db.event(chat_id, actor_id, "manual_ban")
+            done = "🔨 Забанен, все его сообщения в группе удалены"
+        elif kind == "pc":
+            done = "Отменено"
         elif kind == "ok":
             db.set_trusted(int(args[0]))
             done = "✅ Добавлен в доверенные"
@@ -647,12 +656,53 @@ async def cmd_delexample(message: Message, command: CommandObject):
 async def on_owner_example(message: Message):
     """Любой текст или пересланное сообщение от владельца в личке становится образцом спама."""
     text = message.text or message.caption or ""
-    if len(word_set(text)) < 3:
-        await message.answer("Слишком коротко для образца: нужно хотя бы 3 слова. Для отдельных слов есть /addword.")
+    origin = message.forward_origin
+    author_id, author_name = None, None
+    if origin is not None and getattr(origin, "sender_user", None):
+        author_id, author_name = origin.sender_user.id, origin.sender_user.full_name
+    elif origin is not None and getattr(origin, "sender_chat", None):
+        author_id, author_name = origin.sender_chat.id, origin.sender_chat.title
+
+    if len(word_set(text)) >= 3:
+        added = db.add_example(text)
+        reply = (f"Сохранил как образец спама. Всего образцов: {len(db.examples())}."
+                 if added else "Такой образец уже есть.")
+    else:
+        reply = "Слишком коротко для образца (нужно от 3 слов)."
+    if author_id:
+        await message.answer(reply + "\n\n" + purge_question(author_id, author_name), reply_markup=purge_kb(author_id))
+    elif origin is not None:
+        await message.answer(reply + "\n\nАвтор скрыл профиль при пересылке, забанить отсюда не выйдет. "
+                             "Ответь <code>/spam</code> на это сообщение в группе.")
+    else:
+        await message.answer(reply)
+
+
+def purge_question(actor_id: int, name: str | None) -> str:
+    return (f"Автор: {html.escape(name or '?')} (<code>{actor_id}</code>)\n"
+            "Забанить и удалить <b>все</b> его сообщения в группе, в том числе старые?")
+
+
+def purge_kb(actor_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("🔨 Забанить и удалить всё", f"pb:{actor_id}"),
+                                                  btn("Отмена", "pc")]])
+
+
+@router.message(Command("ban"), owner, F.from_user.id == OWNER_ID)
+async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
+    """/ban id — бан с удалением всех сообщений автора (Telegram стирает и старые)."""
+    arg = (command.args or "").strip()
+    if not arg.lstrip("-").isdigit() or not state["chat_id"]:
+        await message.answer("Укажи числовой id: /ban 123456789. Id видно в отчётах бота.")
         return
-    added = db.add_example(text)
-    await message.answer(f"Сохранил как образец спама. Всего образцов: {len(db.examples())}."
-                         if added else "Такой образец уже есть.")
+    actor_id = int(arg)
+    name = None
+    if actor_id > 0:
+        try:
+            name = (await bot.get_chat_member(state["chat_id"], actor_id)).user.full_name
+        except TelegramBadRequest:
+            pass
+    await message.answer(purge_question(actor_id, name), reply_markup=purge_kb(actor_id))
 
 
 @router.message(F.chat.type == "private")
@@ -699,6 +749,7 @@ async def main():
             BotCommand(command="settings", description="Автобан, удаление, пуши, пороги"),
             BotCommand(command="stats", description="Статистика"),
             BotCommand(command="recheck", description="Перепроверить комментарии за сутки"),
+            BotCommand(command="ban", description="Бан по id + удалить все его сообщения"),
             BotCommand(command="mode", description="live — всё вкл, test — всё выкл"),
             BotCommand(command="examples", description="Образцы спама"),
             BotCommand(command="words", description="Стоп-слова"),
