@@ -723,8 +723,7 @@ async def on_owner_links(message: Message, bot: Bot):
     ids = link_msg_ids(message.text)
     log.info("ссылки от владельца: %s -> id %s", LINK_RE.findall(message.text), ids)
     if not ids or not state["chat_id"]:
-        await message.answer("Это ссылка на пост канала, а не на комментарий.
-"
+        await message.answer("Это ссылка на пост канала, а не на комментарий.\n"
                              "Нужна ссылка на сам комментарий: открой комментарии → зажми спам-сообщение → "
                              "«Копировать ссылку». В ней будет <code>?comment=</code>.")
         return
