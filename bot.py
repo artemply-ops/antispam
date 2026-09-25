@@ -1,6 +1,7 @@
 """Антиспам-бот для комментариев канала «За гранью»."""
 import asyncio
 import html
+import re
 import json
 import logging
 import os
@@ -11,7 +12,8 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import MessageEntityType
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.client.session.middlewares.base import BaseRequestMiddleware
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import Command, CommandObject
 from aiogram.types import (BotCommand, BotCommandScopeChat, CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, Message)
@@ -123,12 +125,13 @@ class DB:
         return self.c.execute("SELECT chat_id, msg_id, actor_id, actor_name, features FROM messages "
                               "WHERE ts>=? AND handled=0 ORDER BY ts", (since,)).fetchall()
 
-    def mark_handled(self, chat_id, msg_id=None, actor_id=None):
-        if actor_id is not None:  # бан с revoke стирает все сообщения автора
-            self.c.execute("UPDATE messages SET handled=1 WHERE chat_id=? AND actor_id=?", (chat_id, actor_id))
-        else:
-            self.c.execute("UPDATE messages SET handled=1 WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
+    def mark_handled(self, chat_id, msg_id):
+        self.c.execute("UPDATE messages SET handled=1 WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
         self.c.commit()
+
+    def actor_messages(self, chat_id, actor_id):
+        return [r[0] for r in self.c.execute(
+            "SELECT msg_id FROM messages WHERE chat_id=? AND actor_id=? AND handled=0", (chat_id, actor_id))]
 
     def get_setting(self, key, default: int) -> int:
         row = self.c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -163,6 +166,21 @@ cas_cache: dict = {}
 
 
 # ---------- помощники ----------
+class RetryOnNetworkError(BaseRequestMiddleware):
+    """Связь сервера с api.telegram.org иногда подвисает: повторяем запрос до 3 раз."""
+
+    async def __call__(self, make_request, bot, method):
+        if type(method).__name__ == "GetUpdates":  # поллинг сам умеет переподключаться
+            return await make_request(bot, method)
+        for attempt in range(3):
+            try:
+                return await make_request(bot, method)
+            except TelegramNetworkError as e:
+                if attempt == 2:
+                    raise
+                log.warning("сеть: %s, повтор %s", e.message, attempt + 1)
+                await asyncio.sleep(2 * (attempt + 1))
+
 async def admin_ids(bot: Bot, chat_id: int) -> set:
     ids, ts = admin_cache.get(chat_id, (set(), 0))
     if time.time() - ts > 600:
@@ -196,6 +214,22 @@ async def ban_actor(bot: Bot, chat_id: int, actor_id: int):
         await bot.ban_chat_sender_chat(chat_id, actor_id)
     else:
         await bot.ban_chat_member(chat_id, actor_id, revoke_messages=True)
+
+
+async def ban_and_clean(bot: Bot, chat_id: int, actor_id: int) -> int:
+    """Бан + удаление всех сообщений автора, которые бот видел (хранятся 48 ч).
+    Bot API не умеет «удалить всю историю пользователя», поэтому более старые сообщения — только по ссылке."""
+    await ban_actor(bot, chat_id, actor_id)
+    db.set_trusted(actor_id, False)
+    removed = 0
+    for msg_id in db.actor_messages(chat_id, actor_id):
+        try:
+            await bot.delete_message(chat_id, msg_id)
+            removed += 1
+        except TelegramBadRequest:
+            pass
+        db.mark_handled(chat_id, msg_id)
+    return removed
 
 
 async def unban_actor(bot: Bot, chat_id: int, actor_id: int):
@@ -284,10 +318,10 @@ async def cmd_spam(message: Message, bot: Bot):
         return
     actor_id = target.sender_chat.id if target.sender_chat else target.from_user.id
     await target.delete()
-    await ban_actor(bot, message.chat.id, actor_id)
+    db.mark_handled(message.chat.id, target.message_id)
+    await ban_and_clean(bot, message.chat.id, actor_id)
     text = target.text or target.caption or ""
     db.event(message.chat.id, actor_id, "manual_ban", text=text)
-    db.mark_handled(message.chat.id, actor_id=actor_id)
     if len(word_set(text)) >= 3:
         db.add_example(text)
 
@@ -331,15 +365,15 @@ async def on_group_message(message: Message, bot: Bot):
                 errors.append(f"удалить: {e.message}")
         if cfg("autoban"):
             try:
-                await ban_actor(bot, chat_id, actor_id)
+                if deleted:
+                    db.mark_handled(chat_id, msg_id)
+                await ban_and_clean(bot, chat_id, actor_id)
                 banned = True
             except TelegramBadRequest as e:
                 errors.append(f"забанить: {e.message}")
         action = "ban" if banned else "delete" if deleted else "spam_detected"
         db.event(chat_id, actor_id, action, verdict, f.text)
-        if banned:
-            db.mark_handled(chat_id, actor_id=actor_id)
-        elif deleted:
+        if deleted:
             db.mark_handled(chat_id, msg_id)
         log.info("спам от %s, баллы %s, действие %s %s", actor_id, verdict.score, action, errors or "")
         if banned:
@@ -427,10 +461,10 @@ async def on_button(cb: CallbackQuery, bot: Bot):
                 await bot.delete_message(chat_id, msg_id)
             except TelegramBadRequest:
                 pass
-            await ban_actor(bot, chat_id, actor_id)
+            db.mark_handled(chat_id, msg_id)
+            extra = await ban_and_clean(bot, chat_id, actor_id)
             db.event(chat_id, actor_id, "manual_ban")
-            db.mark_handled(chat_id, actor_id=actor_id)
-            done = "🔨 Забанен"
+            done = "🔨 Забанен" + (f", удалено ещё его сообщений: {extra}" if extra else "")
         elif kind == "d":
             chat_id, msg_id = map(int, args)
             await bot.delete_message(chat_id, msg_id)
@@ -445,11 +479,24 @@ async def on_button(cb: CallbackQuery, bot: Bot):
             done = "↩️ Разбанен и добавлен в доверенные"
         elif kind == "pb":
             chat_id, actor_id = state["chat_id"], int(args[0])
-            await ban_actor(bot, chat_id, actor_id)
-            db.mark_handled(chat_id, actor_id=actor_id)
-            db.set_trusted(actor_id, False)
+            extra = await ban_and_clean(bot, chat_id, actor_id)
             db.event(chat_id, actor_id, "manual_ban")
-            done = "🔨 Забанен, все его сообщения в группе удалены"
+            done = (f"🔨 Забанен. Удалено его сообщений, которые видел бот: {extra}\n"
+                    "Более старые пришли ссылками — удалю по одной.")
+        elif kind in ("ld", "lb"):
+            chat_id, msg_id, actor_id = state["chat_id"], int(args[0]), int(args[1])
+            try:
+                await bot.delete_message(chat_id, msg_id)
+            except TelegramBadRequest as e:
+                if "not found" not in e.message:
+                    raise
+            db.mark_handled(chat_id, msg_id)
+            db.event(chat_id, actor_id, "manual_delete")
+            done = "🗑 Удалено"
+            if kind == "lb" and actor_id:
+                extra = await ban_and_clean(bot, chat_id, actor_id)
+                db.event(chat_id, actor_id, "manual_ban")
+                done += ", автор забанен" + (f", ещё его сообщений удалено: {extra}" if extra else "")
         elif kind == "pc":
             done = "Отменено"
         elif kind == "ok":
@@ -480,6 +527,8 @@ async def cmd_help(message: Message):
         "/stats — статистика\n"
         "/recheck [часы] — перепроверить комментарии за сутки (до 48 ч) и применить действия\n"
         "/words — свои стоп-слова\n/addword слово — добавить\n/delword слово — удалить\n"
+        "/ban id — забанить и удалить его сообщения за 48 ч\n"
+        "ссылка на комментарий (или несколько) — покажу его и удалю по кнопке\n"
         "/unban id — разбанить\n/trust id — в доверенные\n\n"
         "<b>Образцы спама</b> (похожее считается спамом сразу):\n"
         "перешли мне спам-сообщение или просто пришли его текст — сохраню как образец\n"
@@ -620,10 +669,9 @@ async def on_recheck_button(cb: CallbackQuery, bot: Bot):
             errors.append(e.message)
         if what == "ban" and actor_id not in banned_actors:
             try:
-                await ban_actor(bot, chat_id, actor_id)
+                deleted += await ban_and_clean(bot, chat_id, actor_id)
                 banned_actors.add(actor_id)
                 banned += 1
-                db.mark_handled(chat_id, actor_id=actor_id)
             except TelegramBadRequest as e:
                 errors.append(e.message)
         db.mark_handled(chat_id, it["msg_id"])
@@ -650,6 +698,58 @@ async def cmd_examples(message: Message):
 async def cmd_delexample(message: Message, command: CommandObject):
     ok = (command.args or "").strip().isdigit() and db.del_example(int(command.args))
     await message.answer("Удалено." if ok else "Укажи номер из /examples")
+
+
+LINK_RE = re.compile(r"t\.me/(?:c/)?([\w\d]+)/(\d+)(?:/(\d+))?(?:\?(?:[^\s]*&)?comment=(\d+))?")
+
+
+def link_msg_ids(text: str) -> list:
+    """Ссылки на комментарии: t.me/c/<группа>/<id>, t.me/<канал>/<пост>?comment=<id>, t.me/c/<группа>/<тред>/<id>."""
+    group_internal = str(state["chat_id"]).removeprefix("-100")
+    ids = []
+    for chat, first, second, comment in LINK_RE.findall(text):
+        if comment:
+            ids.append(int(comment))
+        elif chat == group_internal or not chat.isdigit():
+            ids.append(int(second or first))
+    return list(dict.fromkeys(ids))
+
+
+@router.message(owner, F.from_user.id == OWNER_ID, F.text.regexp(r"t\.me/"), F.forward_origin.is_(None))
+async def on_owner_links(message: Message, bot: Bot):
+    """Владелец прислал ссылки на комментарии: прочитать через пересылку себе и предложить удалить."""
+    ids = link_msg_ids(message.text)
+    if not ids or not state["chat_id"]:
+        await message.answer("Не нашёл ссылок на комментарии. Нужна ссылка вида t.me/…?comment=123 "
+                             "(в Telegram: сообщение → «Копировать ссылку»).")
+        return
+    for msg_id in ids[:20]:
+        text, author_id, author = "", 0, "не удалось определить"
+        try:
+            fwd = await bot.forward_message(OWNER_ID, state["chat_id"], msg_id, disable_notification=True)
+            text = fwd.text or fwd.caption or "(без текста)"
+            o = fwd.forward_origin
+            if getattr(o, "sender_user", None):
+                author_id, author = o.sender_user.id, o.sender_user.full_name
+            elif getattr(o, "sender_chat", None):
+                author_id, author = o.sender_chat.id, o.sender_chat.title
+            elif getattr(o, "sender_user_name", None):
+                author = o.sender_user_name + " (профиль скрыт, забанить не выйдет)"
+            await bot.delete_message(OWNER_ID, fwd.message_id)
+        except TelegramBadRequest as e:
+            if "not found" in e.message:
+                await message.answer(f"Сообщение {msg_id}: не найдено (уже удалено или ссылка не на эту группу).")
+                continue
+            text = f"(не смог прочитать: {e.message})"
+        row = [btn("🗑 Удалить", f"ld:{msg_id}:{author_id}")]
+        if author_id:
+            row.append(btn("🔨 Удалить + бан", f"lb:{msg_id}:{author_id}"))
+        row.append(btn("Отмена", "pc"))
+        await message.answer(f"<b>Сообщение {msg_id}</b>\nАвтор: {html.escape(author)}"
+                             + (f" (<code>{author_id}</code>)" if author_id else "")
+                             + f"\nТекст: <i>{html.escape(text[:300])}</i>",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[row]))
+        await asyncio.sleep(0.3)
 
 
 @router.message(owner, F.from_user.id == OWNER_ID, ~F.text.startswith("/"))
@@ -680,17 +780,18 @@ async def on_owner_example(message: Message):
 
 def purge_question(actor_id: int, name: str | None) -> str:
     return (f"Автор: {html.escape(name or '?')} (<code>{actor_id}</code>)\n"
-            "Забанить и удалить <b>все</b> его сообщения в группе, в том числе старые?")
+            "Забанить? Заодно удалю его сообщения, которые видел (за последние 48 ч).\n"
+            "Более старые Telegram ботам удалять целиком не даёт — пришли на них ссылки.")
 
 
 def purge_kb(actor_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[btn("🔨 Забанить и удалить всё", f"pb:{actor_id}"),
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("🔨 Забанить", f"pb:{actor_id}"),
                                                   btn("Отмена", "pc")]])
 
 
 @router.message(Command("ban"), owner, F.from_user.id == OWNER_ID)
 async def cmd_ban(message: Message, command: CommandObject, bot: Bot):
-    """/ban id — бан с удалением всех сообщений автора (Telegram стирает и старые)."""
+    """/ban id — бан + удаление сообщений автора, которые видел бот."""
     arg = (command.args or "").strip()
     if not arg.lstrip("-").isdigit() or not state["chat_id"]:
         await message.answer("Укажи числовой id: /ban 123456789. Id видно в отчётах бота.")
@@ -728,6 +829,7 @@ def import_examples_file(path="spam_examples.txt"):
 async def main():
     log.info("импортировано образцов из spam_examples.txt: %s", import_examples_file())
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    bot.session.middleware(RetryOnNetworkError())
     me = await bot.get_me()
     if OWNER_ID == me.id:
         log.error("OWNER_ID=%s — это id самого бота. Напиши боту в личку, он ответит твоим id", OWNER_ID)
@@ -749,7 +851,7 @@ async def main():
             BotCommand(command="settings", description="Автобан, удаление, пуши, пороги"),
             BotCommand(command="stats", description="Статистика"),
             BotCommand(command="recheck", description="Перепроверить комментарии за сутки"),
-            BotCommand(command="ban", description="Бан по id + удалить все его сообщения"),
+            BotCommand(command="ban", description="Бан по id + удалить его сообщения за 48 ч"),
             BotCommand(command="mode", description="live — всё вкл, test — всё выкл"),
             BotCommand(command="examples", description="Образцы спама"),
             BotCommand(command="words", description="Стоп-слова"),
