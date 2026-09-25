@@ -3,3 +3,5 @@ antispam.db
 __pycache__/
 .pytest_cache/
 PROJECT_MEMORY.md
+assets/*.png
+assets/*.jpg
