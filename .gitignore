@@ -1,0 +1,4 @@
+﻿.env
+antispam.db
+__pycache__/
+.pytest_cache/
