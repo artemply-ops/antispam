@@ -321,14 +321,29 @@ def settings_view():
             "Если автобан выключен, пуш с кнопкой «Забанить» приходит всегда.\n\n"
             f"Спам — от <b>{cfg('ban_score')}</b> баллов, подозрительное — от <b>{cfg('suspect_score')}</b>.")
     rows = [[btn(("✅ " if cfg(k) else "❌ ") + name, f"s:{k}")] for k, name in TOGGLES]
-    for key, name in (("ban_score", "Порог спама"), ("suspect_score", "Порог подозрения")):
-        rows.append([btn("−", f"s:{key}:-1"), btn(f"{name}: {cfg(key)}", "s:noop"), btn("+", f"s:{key}:1")])
+    # Подпись порога отдельной строкой на всю ширину, иначе на телефоне она обрезается
+    for key, name in (("ban_score", "🚨 Спам"), ("suspect_score", "⚠️ Подозрение")):
+        rows.append([btn(f"{name}: от {cfg(key)} баллов", "s:noop")])
+        rows.append([btn("➖ меньше", f"s:{key}:-1"), btn("➕ больше", f"s:{key}:1")])
+    rows.append([btn("✔️ Готово", "s:done")])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def settings_summary() -> str:
+    on = lambda k: "вкл" if cfg(k) else "выкл"
+    return ("<b>Настройки сохранены</b>\n"
+            f"Автобан: {on('autoban')}, автоудаление: {on('autodelete')}, пуш об автобане: {on('notify')}\n"
+            f"Спам от {cfg('ban_score')} баллов, подозрение от {cfg('suspect_score')}\n"
+            "Изменить: /settings")
 
 
 @router.callback_query(F.from_user.id == OWNER_ID, F.data.startswith("s:"))
 async def on_settings_button(cb: CallbackQuery):
     _, key, *delta = cb.data.split(":")
+    if key == "done":
+        await cb.message.edit_text(settings_summary(), reply_markup=None)
+        await cb.answer("Готово")
+        return
     if key in ("autoban", "autodelete", "notify") and not delta:
         db.set_setting(key, 1 - cfg(key))
     elif key in ("ban_score", "suspect_score") and delta:
