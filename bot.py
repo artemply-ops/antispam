@@ -26,6 +26,7 @@ DISCUSSION_CHAT_ID = int(os.getenv("DISCUSSION_CHAT_ID") or 0)
 BAN_SCORE = int(os.getenv("BAN_SCORE", "5"))
 SUSPECT_SCORE = int(os.getenv("SUSPECT_SCORE", "3"))
 TRUST_AFTER = int(os.getenv("TRUST_AFTER", "3"))
+TRUST_HOURS = int(os.getenv("TRUST_HOURS", "24"))
 CAS_ENABLED = os.getenv("CAS_ENABLED", "1") == "1"
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 DB_PATH = os.getenv("DB_PATH", "antispam.db")
@@ -47,14 +48,22 @@ class DB:
             CREATE TABLE IF NOT EXISTS events(ts INTEGER, chat_id INTEGER, actor_id INTEGER, action TEXT,
                                               score INTEGER, reasons TEXT, text TEXT);
         """)
+        if "first_seen" not in {r[1] for r in self.c.execute("PRAGMA table_info(users)")}:
+            self.c.execute("ALTER TABLE users ADD COLUMN first_seen INTEGER")
+            self.c.commit()
 
     def clean_count(self, uid):
         row = self.c.execute("SELECT clean, trusted FROM users WHERE id=?", (uid,)).fetchone()
         return row or (0, 0)
 
     def add_clean(self, uid):
-        self.c.execute("INSERT INTO users(id, clean) VALUES(?, 1) ON CONFLICT(id) DO UPDATE SET clean=clean+1", (uid,))
-        self.c.execute("UPDATE users SET trusted=1 WHERE id=? AND clean>=?", (uid, TRUST_AFTER))
+        now = int(time.time())
+        self.c.execute("INSERT INTO users(id, clean, first_seen) VALUES(?, 1, ?) "
+                       "ON CONFLICT(id) DO UPDATE SET clean=clean+1, first_seen=COALESCE(first_seen, ?)",
+                       (uid, now, now))
+        # Доверие: N чистых комментариев И прошли сутки с первого. Спамер, пишущий пачкой, не проскочит
+        self.c.execute("UPDATE users SET trusted=1 WHERE id=? AND clean>=? AND first_seen<=?",
+                       (uid, TRUST_AFTER, now - TRUST_HOURS * 3600))
         self.c.commit()
 
     def set_trusted(self, uid, value=True):
@@ -265,9 +274,14 @@ async def on_group_message(message: Message, bot: Bot):
     clean, trusted = db.clean_count(actor_id)
     f = features_from(message, actor_name, first=clean == 0, foreign_chat=bool(sc))
 
-    if trusted and not f.has_inline_keyboard:
-        return
-    verdict = score_message(f, db.words(), [t for _, t in db.examples()])
+    examples = [t for _, t in db.examples()]
+    if trusted:
+        # Доверенных проверяем только на кнопки под сообщением и совпадение с образцами спама
+        verdict = score_message(Features(text=f.text, has_inline_keyboard=f.has_inline_keyboard), (), examples)
+        if verdict.score < cfg("ban_score"):
+            return
+    else:
+        verdict = score_message(f, db.words(), examples)
     if await cas_banned(actor_id):
         verdict.add(10, "в базе спамеров CAS")
 
