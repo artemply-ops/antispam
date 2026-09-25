@@ -185,6 +185,7 @@ def features_from(message: Message, actor_name: str, first: bool, foreign_chat: 
 # ---------- команды в группе ----------
 @router.message(Command("chatid"), F.chat.type.in_({"group", "supergroup"}))
 async def cmd_chatid(message: Message, bot: Bot):
+    log.info("/chatid в чате %s «%s»", message.chat.id, message.chat.title)
     if message.from_user and message.from_user.id in await admin_ids(bot, message.chat.id):
         await message.reply(f"ID этого чата: <code>{message.chat.id}</code>")
 
@@ -396,6 +397,15 @@ async def on_owner_example(message: Message):
                          if added else "Такой образец уже есть.")
 
 
+@router.message(F.chat.type == "private")
+async def on_stranger(message: Message):
+    """Не владелец пишет в личку: подсказать его id (так проще всего узнать OWNER_ID)."""
+    u = message.from_user
+    log.info("личное сообщение от id=%s @%s", u.id, u.username)
+    await message.answer(f"Твой Telegram id: <code>{u.id}</code>\n"
+                         "Если ты владелец бота, этот id нужно прописать в OWNER_ID.")
+
+
 def import_examples_file(path="spam_examples.txt"):
     """Образцы из файла: блоки текста, разделённые строкой ---. Строки с # игнорируются."""
     if not os.path.exists(path):
@@ -410,6 +420,13 @@ def import_examples_file(path="spam_examples.txt"):
 async def main():
     log.info("импортировано образцов из spam_examples.txt: %s", import_examples_file())
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+    me = await bot.get_me()
+    if OWNER_ID == me.id:
+        log.error("OWNER_ID=%s — это id самого бота. Напиши боту в личку, он ответит твоим id", OWNER_ID)
+    if state["chat_id"] >= 0 or state["chat_id"] == CHANNEL_ID:
+        if state["chat_id"]:
+            log.warning("DISCUSSION_CHAT_ID=%s не похож на группу обсуждения, ищу сам", state["chat_id"])
+        state["chat_id"] = 0
     if not state["chat_id"]:
         try:
             state["chat_id"] = (await bot.get_chat(CHANNEL_ID)).linked_chat_id or 0
