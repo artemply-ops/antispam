@@ -1,6 +1,7 @@
 """Антиспам-бот для комментариев канала «За гранью»."""
 import asyncio
 import html
+import json
 import logging
 import os
 import sqlite3
@@ -16,6 +17,8 @@ from aiogram.types import (BotCommand, BotCommandScopeChat, CallbackQuery, Inlin
                            InlineKeyboardMarkup, Message)
 from dotenv import load_dotenv
 
+from dataclasses import asdict
+
 from spam_filter import Features, Verdict, score_message, word_set
 
 load_dotenv()
@@ -30,6 +33,7 @@ TRUST_HOURS = int(os.getenv("TRUST_HOURS", "24"))
 CAS_ENABLED = os.getenv("CAS_ENABLED", "1") == "1"
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"
 DB_PATH = os.getenv("DB_PATH", "antispam.db")
+KEEP_HOURS = 48  # столько храним комментарии для /recheck; старше бот удалить всё равно не может
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("antispam")
@@ -43,6 +47,10 @@ class DB:
         self.c.executescript("""
             CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, clean INTEGER DEFAULT 0, trusted INTEGER DEFAULT 0);
             CREATE TABLE IF NOT EXISTS words(word TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS messages(chat_id INTEGER, msg_id INTEGER, actor_id INTEGER, actor_name TEXT,
+                                                features TEXT, ts INTEGER, handled INTEGER DEFAULT 0,
+                                                PRIMARY KEY(chat_id, msg_id));
+            CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value INTEGER);
             CREATE TABLE IF NOT EXISTS examples(id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT UNIQUE);
             CREATE TABLE IF NOT EXISTS events(ts INTEGER, chat_id INTEGER, actor_id INTEGER, action TEXT,
@@ -101,6 +109,25 @@ class DB:
                        (int(time.time()), chat_id, actor_id, action,
                         verdict.score if verdict else 0,
                         "; ".join(verdict.reasons) if verdict else "", text[:500]))
+        self.c.commit()
+
+    def save_message(self, chat_id, msg_id, actor_id, actor_name, f: Features):
+        now = int(time.time())
+        self.c.execute("INSERT INTO messages(chat_id, msg_id, actor_id, actor_name, features, ts) VALUES(?,?,?,?,?,?) "
+                       "ON CONFLICT(chat_id, msg_id) DO UPDATE SET features=excluded.features",
+                       (chat_id, msg_id, actor_id, actor_name, json.dumps(asdict(f), ensure_ascii=False), now))
+        self.c.execute("DELETE FROM messages WHERE ts<?", (now - KEEP_HOURS * 3600,))
+        self.c.commit()
+
+    def recent_messages(self, since):
+        return self.c.execute("SELECT chat_id, msg_id, actor_id, actor_name, features FROM messages "
+                              "WHERE ts>=? AND handled=0 ORDER BY ts", (since,)).fetchall()
+
+    def mark_handled(self, chat_id, msg_id=None, actor_id=None):
+        if actor_id is not None:  # бан с revoke стирает все сообщения автора
+            self.c.execute("UPDATE messages SET handled=1 WHERE chat_id=? AND actor_id=?", (chat_id, actor_id))
+        else:
+            self.c.execute("UPDATE messages SET handled=1 WHERE chat_id=? AND msg_id=?", (chat_id, msg_id))
         self.c.commit()
 
     def get_setting(self, key, default: int) -> int:
@@ -199,6 +226,17 @@ def report(title, name, actor_id, verdict: Verdict, text, link=None) -> str:
     return "\n".join(parts)
 
 
+async def evaluate(f: Features, actor_id: int, trusted: bool) -> Verdict:
+    examples = [t for _, t in db.examples()]
+    if trusted:
+        # Доверенных проверяем только на кнопки под сообщением и совпадение с образцами спама
+        return score_message(Features(text=f.text, has_inline_keyboard=f.has_inline_keyboard), (), examples)
+    verdict = score_message(f, db.words(), examples)
+    if await cas_banned(actor_id):
+        verdict.add(10, "в базе спамеров CAS")
+    return verdict
+
+
 def btn(text, data):
     return InlineKeyboardButton(text=text, callback_data=data)
 
@@ -249,6 +287,7 @@ async def cmd_spam(message: Message, bot: Bot):
     await ban_actor(bot, message.chat.id, actor_id)
     text = target.text or target.caption or ""
     db.event(message.chat.id, actor_id, "manual_ban", text=text)
+    db.mark_handled(message.chat.id, actor_id=actor_id)
     if len(word_set(text)) >= 3:
         db.add_example(text)
 
@@ -274,16 +313,10 @@ async def on_group_message(message: Message, bot: Bot):
     clean, trusted = db.clean_count(actor_id)
     f = features_from(message, actor_name, first=clean == 0, foreign_chat=bool(sc))
 
-    examples = [t for _, t in db.examples()]
-    if trusted:
-        # Доверенных проверяем только на кнопки под сообщением и совпадение с образцами спама
-        verdict = score_message(Features(text=f.text, has_inline_keyboard=f.has_inline_keyboard), (), examples)
-        if verdict.score < cfg("ban_score"):
-            return
-    else:
-        verdict = score_message(f, db.words(), examples)
-    if await cas_banned(actor_id):
-        verdict.add(10, "в базе спамеров CAS")
+    db.save_message(chat_id, message.message_id, actor_id, actor_name, f)
+    verdict = await evaluate(f, actor_id, trusted)
+    if trusted and verdict.score < cfg("ban_score"):
+        return
 
     link = msg_link(chat_id, message.message_id)
     msg_id = message.message_id
@@ -304,6 +337,10 @@ async def on_group_message(message: Message, bot: Bot):
                 errors.append(f"забанить: {e.message}")
         action = "ban" if banned else "delete" if deleted else "spam_detected"
         db.event(chat_id, actor_id, action, verdict, f.text)
+        if banned:
+            db.mark_handled(chat_id, actor_id=actor_id)
+        elif deleted:
+            db.mark_handled(chat_id, msg_id)
         log.info("спам от %s, баллы %s, действие %s %s", actor_id, verdict.score, action, errors or "")
         if banned:
             title = "🔨 Спам: удалён, автор забанен"
@@ -392,11 +429,13 @@ async def on_button(cb: CallbackQuery, bot: Bot):
                 pass
             await ban_actor(bot, chat_id, actor_id)
             db.event(chat_id, actor_id, "manual_ban")
+            db.mark_handled(chat_id, actor_id=actor_id)
             done = "🔨 Забанен"
         elif kind == "d":
             chat_id, msg_id = map(int, args)
             await bot.delete_message(chat_id, msg_id)
             db.event(chat_id, 0, "manual_delete")
+            db.mark_handled(chat_id, msg_id)
             done = "🗑 Удалено"
         elif kind == "u":
             chat_id, actor_id = map(int, args)
@@ -430,6 +469,7 @@ async def cmd_help(message: Message):
         "/settings — автобан, автоудаление, пуши, пороги\n"
         "/mode live|test — всё включить / всё выключить\n"
         "/stats — статистика\n"
+        "/recheck [часы] — перепроверить комментарии за сутки (до 48 ч) и применить действия\n"
         "/words — свои стоп-слова\n/addword слово — добавить\n/delword слово — удалить\n"
         "/unban id — разбанить\n/trust id — в доверенные\n\n"
         "<b>Образцы спама</b> (похожее считается спамом сразу):\n"
@@ -448,7 +488,8 @@ async def cmd_settings(message: Message):
 async def cmd_stats(message: Message):
     names = {"ban": "Забанено авто", "manual_ban": "Забанено вручную", "delete": "Удалено авто без бана",
              "manual_delete": "Удалено вручную", "spam_detected": "Спам без действий",
-             "suspect": "Подозрительных", "dry_ban": "Был бы бан (тест)", "unban": "Разбанено"}
+             "suspect": "Подозрительных", "recheck_ban": "Забанено перепроверкой",
+             "recheck_delete": "Удалено перепроверкой", "dry_ban": "Был бы бан (тест)", "unban": "Разбанено"}
     out = []
     for title, since in (("24 часа", time.time() - 86400), ("7 дней", time.time() - 7 * 86400), ("всё время", 0)):
         s = db.stats(int(since))
@@ -494,6 +535,96 @@ async def cmd_unban(message: Message, command: CommandObject, bot: Bot):
         await unban_actor(bot, state["chat_id"], actor_id)
         db.event(state["chat_id"], actor_id, "unban")
     await message.answer("Готово.")
+
+
+@router.message(Command("recheck"), owner, F.from_user.id == OWNER_ID)
+async def cmd_recheck(message: Message, command: CommandObject):
+    """Перепроверить сохранённые комментарии текущим фильтром и порогами."""
+    arg = (command.args or "").strip()
+    hours = int(arg) if arg.isdigit() else 24
+    hours = min(max(hours, 1), KEEP_HOURS)
+    rows = db.recent_messages(int(time.time()) - hours * 3600)
+    spam, suspect = [], []
+    for chat_id, msg_id, actor_id, name, fjson in rows:
+        f = Features(**json.loads(fjson))
+        _, trusted = db.clean_count(actor_id)
+        v = await evaluate(f, actor_id, trusted)
+        item = {"chat_id": chat_id, "msg_id": msg_id, "actor_id": actor_id, "name": name, "text": f.text, "v": v}
+        if v.score >= cfg("ban_score"):
+            spam.append(item)
+        elif v.score >= cfg("suspect_score") and not trusted:
+            suspect.append(item)
+    state["recheck"] = {"spam": spam, "suspect": suspect}
+
+    def line(it):
+        return (f"• {html.escape(it['name'][:30])} — {it['v'].score} б.: "
+                f"<a href=\"{msg_link(it['chat_id'], it['msg_id'])}\">{html.escape(it['text'][:60]) or '—'}</a>")
+
+    out = [f"<b>Перепроверка за {hours} ч</b>",
+           f"Сообщений в памяти: {len(rows)} (храню {KEEP_HOURS} ч, считаю с момента включения функции)",
+           f"Спам: <b>{len(spam)}</b>, подозрительных: <b>{len(suspect)}</b>"]
+    if spam:
+        out += ["", "<b>Спам:</b>"] + [line(i) for i in spam[:15]] + ([f"…и ещё {len(spam) - 15}"] if len(spam) > 15 else [])
+    if suspect:
+        out += ["", "<b>Подозрительные:</b>"] + [line(i) for i in suspect[:10]] + (
+            [f"…и ещё {len(suspect) - 10}"] if len(suspect) > 10 else [])
+    rows_kb = []
+    if spam:
+        rows_kb.append([btn(f"🔨 Удалить и забанить ({len(spam)})", "rc:ban")])
+        rows_kb.append([btn(f"🗑 Только удалить ({len(spam)})", "rc:del")])
+    if suspect:
+        rows_kb.append([btn(f"⚠️ Прислать подозрительные с кнопками ({min(len(suspect), 20)})", "rc:sus")])
+    if rows_kb:
+        rows_kb.append([btn("Отмена", "rc:cancel")])
+    await message.answer("\n".join(out)[:4000], disable_web_page_preview=True,
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows_kb) if rows_kb else None)
+
+
+@router.callback_query(F.from_user.id == OWNER_ID, F.data.startswith("rc:"))
+async def on_recheck_button(cb: CallbackQuery, bot: Bot):
+    what = cb.data.split(":")[1]
+    rc = state.pop("recheck", None) if what != "sus" else state.get("recheck")
+    if what == "cancel" or not rc:
+        await cb.message.edit_reply_markup(reply_markup=None)
+        await cb.answer("Отменено" if what == "cancel" else "Результат устарел, запусти /recheck ещё раз",
+                        show_alert=what != "cancel")
+        return
+    await cb.answer("Выполняю…")
+    if what == "sus":
+        for it in rc["suspect"][:20]:
+            await notify(bot, report("⚠️ Подозрительный (перепроверка)", it["name"], it["actor_id"], it["v"], it["text"],
+                                     msg_link(it["chat_id"], it["msg_id"])),
+                         decision_kb(it["chat_id"], it["actor_id"], it["msg_id"], deleted=False))
+            await asyncio.sleep(0.1)
+        rc["suspect"] = []
+        await cb.message.edit_reply_markup(reply_markup=None)
+        return
+    deleted = banned = 0
+    errors = []
+    banned_actors = set()
+    for it in rc["spam"]:
+        chat_id, actor_id = it["chat_id"], it["actor_id"]
+        try:
+            await bot.delete_message(chat_id, it["msg_id"])
+            deleted += 1
+        except TelegramBadRequest as e:
+            errors.append(e.message)
+        if what == "ban" and actor_id not in banned_actors:
+            try:
+                await ban_actor(bot, chat_id, actor_id)
+                banned_actors.add(actor_id)
+                banned += 1
+                db.mark_handled(chat_id, actor_id=actor_id)
+            except TelegramBadRequest as e:
+                errors.append(e.message)
+        db.mark_handled(chat_id, it["msg_id"])
+        db.event(chat_id, actor_id, "recheck_ban" if what == "ban" else "recheck_delete", it["v"], it["text"])
+        await asyncio.sleep(0.05)
+    result = f"<b>Готово:</b> удалено {deleted}, забанено {banned}"
+    if errors:
+        result += f"\nОшибок: {len(errors)} (например: {html.escape(errors[0])})"
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer(result)
 
 
 @router.message(Command("examples"), owner, F.from_user.id == OWNER_ID)
@@ -567,6 +698,7 @@ async def main():
         await bot.set_my_commands([
             BotCommand(command="settings", description="Автобан, удаление, пуши, пороги"),
             BotCommand(command="stats", description="Статистика"),
+            BotCommand(command="recheck", description="Перепроверить комментарии за сутки"),
             BotCommand(command="mode", description="live — всё вкл, test — всё выкл"),
             BotCommand(command="examples", description="Образцы спама"),
             BotCommand(command="words", description="Стоп-слова"),
