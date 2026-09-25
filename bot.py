@@ -492,6 +492,7 @@ async def on_button(cb: CallbackQuery, bot: Bot):
                     raise
             db.mark_handled(chat_id, msg_id)
             db.event(chat_id, actor_id, "manual_delete")
+            log.info("удалено по ссылке: сообщение %s", msg_id)
             done = "🗑 Удалено"
             if kind == "lb" and actor_id:
                 extra = await ban_and_clean(bot, chat_id, actor_id)
@@ -710,8 +711,9 @@ def link_msg_ids(text: str) -> list:
     for chat, first, second, comment in LINK_RE.findall(text):
         if comment:
             ids.append(int(comment))
-        elif chat == group_internal or not chat.isdigit():
+        elif chat == group_internal:  # ссылка из самой группы обсуждения
             ids.append(int(second or first))
+        # t.me/<канал>/<пост> без ?comment= — это пост канала, а не комментарий: пропускаем
     return list(dict.fromkeys(ids))
 
 
@@ -719,9 +721,12 @@ def link_msg_ids(text: str) -> list:
 async def on_owner_links(message: Message, bot: Bot):
     """Владелец прислал ссылки на комментарии: прочитать через пересылку себе и предложить удалить."""
     ids = link_msg_ids(message.text)
+    log.info("ссылки от владельца: %s -> id %s", LINK_RE.findall(message.text), ids)
     if not ids or not state["chat_id"]:
-        await message.answer("Не нашёл ссылок на комментарии. Нужна ссылка вида t.me/…?comment=123 "
-                             "(в Telegram: сообщение → «Копировать ссылку»).")
+        await message.answer("Это ссылка на пост канала, а не на комментарий.
+"
+                             "Нужна ссылка на сам комментарий: открой комментарии → зажми спам-сообщение → "
+                             "«Копировать ссылку». В ней будет <code>?comment=</code>.")
         return
     for msg_id in ids[:20]:
         text, author_id, author = "", 0, "не удалось определить"
@@ -737,6 +742,7 @@ async def on_owner_links(message: Message, bot: Bot):
                 author = o.sender_user_name + " (профиль скрыт, забанить не выйдет)"
             await bot.delete_message(OWNER_ID, fwd.message_id)
         except TelegramBadRequest as e:
+            log.info("чтение сообщения %s: %s", msg_id, e.message)
             if "not found" in e.message:
                 await message.answer(f"Сообщение {msg_id}: не найдено (уже удалено или ссылка не на эту группу).")
                 continue
